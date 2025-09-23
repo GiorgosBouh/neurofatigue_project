@@ -1,0 +1,516 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+KG Builder for Neurofatigue multimodal dataset:
+- Participants: data/01..12
+- Sessions: per participant 01..03 (low/medium/high)
+- Modalities: EEG, ECG, PPG, Resp, IMU
+- Windowed features + Proxy labels (TIA_like)
+
+Author: you
+"""
+
+import os
+import re
+import math
+import json
+import glob
+import warnings
+from pathlib import Path
+from dataclasses import dataclass
+from typing import Dict, List, Tuple, Optional
+
+import numpy as np
+import pandas as pd
+from scipy.signal import welch
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import pairwise_distances
+from tqdm import tqdm
+import neurokit2 as nk
+
+from neo4j import GraphDatabase
+from dotenv import load_dotenv
+
+warnings.filterwarnings("ignore", category=RuntimeWarning)
+
+# -------------------------
+# Config & Helpers
+# -------------------------
+load_dotenv()
+NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
+NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
+NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "neo4j")
+DATA_ROOT = Path(os.getenv("DATA_ROOT", "./data")).expanduser()
+WIN_SEC = float(os.getenv("WINDOW_SECONDS", "10"))
+OVERLAP = float(os.getenv("WINDOW_OVERLAP", "0.5"))
+
+# Fallback sampling rate if unknown
+DEFAULT_FS = 256.0
+
+# EEG bands (Hz)
+BANDS = {
+    "delta": (0.5, 4),
+    "theta": (4, 8),
+    "alpha": (8, 13),
+    "beta": (13, 30)
+}
+
+# Map session folder to label if needed
+SESSION_MAP = {"01": "low", "02": "medium", "03": "high"}
+
+# -------------------------
+# Neo4j driver
+# -------------------------
+driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+
+def init_constraints():
+    cypher = [
+        "CREATE CONSTRAINT IF NOT EXISTS FOR (p:Participant) REQUIRE p.pid IS UNIQUE",
+        "CREATE CONSTRAINT IF NOT EXISTS FOR (s:Session) REQUIRE s.sid IS UNIQUE",
+        "CREATE CONSTRAINT IF NOT EXISTS FOR (f:SignalFile) REQUIRE f.fid IS UNIQUE",
+        "CREATE CONSTRAINT IF NOT EXISTS FOR (w:TimeWindow) REQUIRE w.wid IS UNIQUE",
+        "CREATE CONSTRAINT IF NOT EXISTS FOR (q:Survey) REQUIRE q.qid IS UNIQUE",
+        "CREATE CONSTRAINT IF NOT EXISTS FOR (m:Meta) REQUIRE m.mid IS UNIQUE",
+        "CREATE INDEX IF NOT EXISTS FOR (feat:Feature) ON (feat.code)",
+        "CREATE INDEX IF NOT EXISTS FOR (ev:Event) ON (ev.type)"
+    ]
+    with driver.session() as s:
+        for c in cypher:
+            s.run(c)
+
+# -------------------------
+# IO & detection
+# -------------------------
+def detect_modality(fname: str) -> Optional[str]:
+    f = fname.lower()
+    if any(k in f for k in ["eeg"]):
+        return "EEG"
+    if any(k in f for k in ["ecg"]):
+        return "ECG"
+    if any(k in f for k in ["ppg", "bvp"]):
+        return "PPG"
+    if any(k in f for k in ["resp", "respiration", "breath"]):
+        return "RESP"
+    if any(k in f for k in ["imu", "acc", "gyro", "motion", "wrist"]):
+        return "IMU"
+    return None
+
+def load_timeseries_csv(path: Path) -> Tuple[np.ndarray, Dict[str, np.ndarray], float]:
+    """
+    Returns (t seconds, channels dict{name->np.array}, fs)
+    Assumes either:
+    - a 'timestamp' or 'time' column in seconds, or
+    - uniform sampling (fallback DEFAULT_FS)
+    """
+    df = pd.read_csv(path)
+    cols = df.columns.tolist()
+    t = None
+    if "timestamp" in df.columns:
+        t = df["timestamp"].to_numpy(dtype=float)
+    elif "time" in df.columns:
+        t = df["time"].to_numpy(dtype=float)
+    else:
+        # create synthetic time assuming uniform sampling
+        fs = DEFAULT_FS
+        t = np.arange(len(df)) / fs
+
+    # estimate fs from time if possible
+    dt = np.diff(t)
+    fs = DEFAULT_FS if len(dt) == 0 else 1.0 / np.median(dt)
+
+    # numeric channels (exclude timestamp/time)
+    chan_cols = [c for c in cols if c.lower() not in ["timestamp", "time"]]
+    chans = {}
+    for c in chan_cols:
+        try:
+            vals = pd.to_numeric(df[c], errors="coerce").to_numpy(dtype=float)
+            if np.isfinite(vals).sum() > 0:
+                chans[c] = np.nan_to_num(vals)
+        except Exception:
+            continue
+    return np.asarray(t, dtype=float), chans, float(fs)
+
+# -------------------------
+# Feature extraction
+# -------------------------
+def window_indices(t: np.ndarray, win_sec: float, overlap: float) -> List[Tuple[int, int]]:
+    if len(t) < 2:
+        return []
+    fs_est = 1.0 / np.median(np.diff(t))
+    wlen = int(round(win_sec * fs_est))
+    hop = max(1, int(round(wlen * (1 - overlap))))
+    idx = []
+    start = 0
+    while start + wlen <= len(t):
+        idx.append((start, start + wlen))
+        start += hop
+    return idx
+
+def eeg_features(seg: np.ndarray, fs: float) -> Dict[str, float]:
+    # Welch PSD
+    f, pxx = welch(seg, fs=fs, nperseg=min(len(seg), 1024))
+    total_power = np.trapz(pxx, f) + 1e-12
+    feats = {}
+    for band, (lo, hi) in BANDS.items():
+        m = (f >= lo) & (f < hi)
+        bp = np.trapz(pxx[m], f[m])
+        feats[f"EEG_bp_{band}"] = float(bp)
+        feats[f"EEG_rel_{band}"] = float(bp / total_power)
+    # ratios & entropy
+    feats["EEG_ratio_theta_alpha"] = feats["EEG_rel_theta"] / (feats["EEG_rel_alpha"] + 1e-12)
+    p_norm = pxx / (pxx.sum() + 1e-12)
+    feats["EEG_spectral_entropy"] = float(-(p_norm * np.log(p_norm + 1e-12)).sum())
+    return feats
+
+def imu_features(seg_xyz: np.ndarray, fs: float) -> Dict[str, float]:
+    # seg_xyz: shape [N, D] (acc/gyro channels)
+    mag = np.linalg.norm(seg_xyz, axis=1)
+    rms = float(np.sqrt(np.mean(mag**2)))
+    # jerk ~ derivative magnitude
+    jerk = np.diff(mag) * fs
+    jerk_rms = float(np.sqrt(np.mean(jerk**2))) if len(jerk) else 0.0
+    return {
+        "IMU_rms": rms,
+        "IMU_jerk_rms": jerk_rms,
+        "IMU_var": float(np.var(mag))
+    }
+
+def hrv_from_ecg_ppg(sig: np.ndarray, fs: float) -> Dict[str, float]:
+    try:
+        # detect peaks & compute rate using NeuroKit
+        _, info = nk.signal_rate(sig, sampling_rate=fs)
+        peaks = info.get("peaks", None)
+        if peaks is None or len(peaks) < 3:
+            return {"HRV_RMSSD": np.nan, "HRV_SDNN": np.nan, "HRV_LFHF": np.nan}
+        rr = np.diff(peaks) / fs  # seconds
+        hrv_time = nk.hrv_time(rr, show=False)
+        rmssd = float(hrv_time.get("HRV_RMSSD", np.nan))
+        sdnn = float(hrv_time.get("HRV_SDNN", np.nan))
+        # rough LF/HF via Lomb (fallback)
+        try:
+            hrv_freq = nk.hrv_frequency(rr, show=False)
+            lfhf = float(hrv_freq.get("HRV_LFHF", np.nan))
+        except Exception:
+            lfhf = np.nan
+        return {"HRV_RMSSD": rmssd, "HRV_SDNN": sdnn, "HRV_LFHF": lfhf}
+    except Exception:
+        return {"HRV_RMSSD": np.nan, "HRV_SDNN": np.nan, "HRV_LFHF": np.nan}
+
+def resp_features(seg: np.ndarray, fs: float) -> Dict[str, float]:
+    try:
+        rate = float(nk.resp_rate(seg, sampling_rate=fs)["Respiratory_Rate"].mean())
+        instab = float(np.std(seg) / (np.mean(np.abs(seg)) + 1e-12))
+        return {"RESP_rate": rate, "RESP_instability": instab}
+    except Exception:
+        return {"RESP_rate": np.nan, "RESP_instability": np.nan}
+
+# -------------------------
+# Proxy labels
+# -------------------------
+def z_score_series(values: List[float]) -> np.ndarray:
+    x = np.asarray(values, dtype=float)
+    mu = np.nanmean(x)
+    sd = np.nanstd(x) + 1e-12
+    return (x - mu) / sd
+
+def proxy_rules(dfw: pd.DataFrame) -> pd.DataFrame:
+    """
+    dfw: window-level rows for a (participant, session)
+    Adds flags:
+      EEG_anomaly: z(theta/alpha) > 2 OR z(spectral_entropy) > 2 OR z(alpha_rel) < -2
+      Gait_instability: z(IMU_rms) > 2 OR z(IMU_jerk_rms) > 2
+      Stress_flag: z(HRV_RMSSD) < -1.5 OR ΔRMSSD% < -20% (approx via z)
+      TIA_like: EEG_anomaly & Gait_instability & Stress_flag(±1 window)
+    """
+    df = dfw.copy()
+
+    # build helpful columns (fallback to NaN if missing)
+    df["theta_alpha"] = df.get("EEG_ratio_theta_alpha", np.nan)
+    df["specent"] = df.get("EEG_spectral_entropy", np.nan)
+    df["alpha_rel"] = df.get("EEG_rel_alpha", np.nan)
+    df["imu_rms"] = df.get("IMU_rms", np.nan)
+    df["imu_jerk"] = df.get("IMU_jerk_rms", np.nan)
+    df["rmssd"] = df.get("HRV_RMSSD", np.nan)
+
+    # z-scores per session
+    def zcol(name):
+        z = z_score_series(df[name].tolist())
+        df[f"z_{name}"] = z
+    for c in ["theta_alpha", "specent", "alpha_rel", "imu_rms", "imu_jerk", "rmssd"]:
+        zcol(c)
+
+    df["EEG_anomaly"] = ((df["z_theta_alpha"] > 2.0) |
+                         (df["z_specent"] > 2.0) |
+                         (df["z_alpha_rel"] < -2.0)).astype(int)
+
+    df["Gait_instability"] = ((df["z_imu_rms"] > 2.0) |
+                              (df["z_imu_jerk"] > 2.0)).astype(int)
+
+    df["Stress_flag"] = (df["z_rmssd"] < -1.5).astype(int)
+
+    # Stress in ±1 window
+    stress_shift = df["Stress_flag"].rolling(window=3, center=True, min_periods=1).max().astype(int)
+
+    df["TIA_like"] = ((df["EEG_anomaly"] == 1) &
+                      (df["Gait_instability"] == 1) &
+                      (stress_shift == 1)).astype(int)
+    return df
+
+# -------------------------
+# Neo4j upserts
+# -------------------------
+def neo4j_merge_participant(tx, pid):
+    tx.run("""
+    MERGE (p:Participant {pid:$pid})
+    """, pid=pid)
+
+def neo4j_merge_session(tx, pid, sid, level):
+    tx.run("""
+    MERGE (s:Session {sid:$sid})
+    SET s.level=$level
+    WITH s
+    MATCH (p:Participant {pid:$pid})
+    MERGE (p)-[:HAS_SESSION]->(s)
+    """, pid=pid, sid=sid, level=level)
+
+def neo4j_merge_signalfile(tx, sid, fid, path, modality, fs):
+    tx.run("""
+    MERGE (f:SignalFile {fid:$fid})
+    SET f.path=$path, f.modality=$modality, f.fs=$fs
+    WITH f
+    MATCH (s:Session {sid:$sid})
+    MERGE (s)-[:HAS_SIGNAL]->(f)
+    """, sid=sid, fid=fid, path=str(path), modality=modality, fs=fs)
+
+def neo4j_merge_window_features(tx, wid, sid, t0, t1, feats: Dict[str, float]):
+    tx.run("""
+    MERGE (w:TimeWindow {wid:$wid})
+    SET w.t0=$t0, w.t1=$t1
+    WITH w
+    MATCH (s:Session {sid:$sid})
+    MERGE (s)-[:HAS_WINDOW]->(w)
+    """, wid=wid, sid=sid, t0=float(t0), t1=float(t1))
+
+    # store features as separate nodes for flexibility
+    feat_rows = [{"wid": wid, "code": k, "value": float(v)} for k, v in feats.items() if np.isfinite(v)]
+    if feat_rows:
+        tx.run("""
+        UNWIND $rows AS r
+        MERGE (w:TimeWindow {wid:r.wid})
+        MERGE (f:Feature {code:r.code})
+        MERGE (w)-[:HAS_FEATURE]->(fv:FeatureValue {code:r.code, wid:r.wid})
+        SET fv.value = r.value
+        """, rows=feat_rows)
+
+def neo4j_merge_events(tx, wid, flags: Dict[str, int]):
+    rows = [{"wid": wid, "type": k, "flag": int(v)} for k, v in flags.items()]
+    tx.run("""
+    UNWIND $rows AS r
+    MERGE (w:TimeWindow {wid:r.wid})
+    MERGE (e:Event {type:r.type})
+    MERGE (w)-[:HAS_EVENT]->(ev:EventFlag {type:r.type, wid:r.wid})
+    SET ev.flag = r.flag
+    """, rows=rows)
+
+def neo4j_merge_survey(tx, pid, qid, payload: Dict):
+    tx.run("""
+    MERGE (q:Survey {qid:$qid})
+    SET q += $data
+    WITH q
+    MATCH (p:Participant {pid:$pid})
+    MERGE (p)-[:HAS_SURVEY]->(q)
+    """, pid=pid, qid=qid, data=payload)
+
+def neo4j_merge_metadata(tx, pid, mid, payload: Dict):
+    tx.run("""
+    MERGE (m:Meta {mid:$mid})
+    SET m += $data
+    WITH m
+    MATCH (p:Participant {pid:$pid})
+    MERGE (p)-[:HAS_META]->(m)
+    """, pid=pid, mid=mid, data=payload)
+
+# -------------------------
+# Main build
+# -------------------------
+def normalize_pid(name: str) -> str:
+    # folder "01" -> "P01"
+    num = re.sub(r"\D", "", name)
+    return f"P{int(num):02d}" if num else name
+
+def normalize_sid(pid: str, sess_folder: str) -> str:
+    label = SESSION_MAP.get(sess_folder, sess_folder)
+    return f"{pid}:{label}"
+
+def collect_surveys(data_root: Path) -> Dict[str, Dict]:
+    out = {}
+    # pre_task_survey
+    pts = data_root / "pre_task_survey.xlsx"
+    if pts.exists():
+        df = pd.read_excel(pts)
+        # Try to map ID -> pid; assumes ID matches folder index
+        if "ID" in df.columns:
+            for _, r in df.iterrows():
+                try:
+                    pid = f"P{int(r['ID']):02d}"
+                except Exception:
+                    continue
+                out.setdefault(pid, {})
+                out[pid]["pre_task"] = {k: (None if pd.isna(v) else v) for k, v in r.to_dict().items()}
+    # preliminary_questionnaire
+    pq = data_root / "preliminary_questionnaire.xlsx"
+    if pq.exists():
+        df = pd.read_excel(pq)
+        # Try best-effort: if there is an "ID" or "Participant" column
+        id_col = None
+        for c in df.columns:
+            if str(c).strip().lower() in ["id", "participant", "participant_id"]:
+                id_col = c
+                break
+        if id_col:
+            for _, r in df.iterrows():
+                try:
+                    pid = f"P{int(r[id_col]):02d}"
+                except Exception:
+                    continue
+                out.setdefault(pid, {})
+                out[pid]["prelim"] = {k: (None if pd.isna(v) else v) for k, v in r.to_dict().items()}
+    return out
+
+def collect_metadata(data_root: Path) -> Dict[str, Dict]:
+    meta_path = data_root / "metadata.csv"
+    if not meta_path.exists():
+        return {}
+    df = pd.read_csv(meta_path)
+    out = {}
+    # expect participant_id and session columns (low/medium/high)
+    pid_col = "participant_id" if "participant_id" in df.columns else df.columns[0]
+    for _, r in df.iterrows():
+        try:
+            pid = f"P{int(r[pid_col]):02d}"
+        except Exception:
+            continue
+        out[pid] = {k: (None if pd.isna(v) else v) for k, v in r.to_dict().items()}
+    return out
+
+def build():
+    print(f"Connecting to Neo4j at {NEO4J_URI} ...")
+    init_constraints()
+    surveys = collect_surveys(DATA_ROOT)
+    meta = collect_metadata(DATA_ROOT)
+
+    participants = sorted([p for p in DATA_ROOT.iterdir() if p.is_dir() and re.match(r"^\d+$", p.name)])
+    for p_dir in tqdm(participants, desc="Participants"):
+        pid = normalize_pid(p_dir.name)
+        with driver.session() as s:
+            s.execute_write(neo4j_merge_participant, pid)
+
+        # attach survey/metadata if available
+        with driver.session() as s:
+            if pid in surveys:
+                for k, payload in surveys[pid].items():
+                    s.execute_write(neo4j_merge_survey, pid, f"{pid}:{k}", payload)
+            if pid in meta:
+                s.execute_write(neo4j_merge_metadata, pid, f"{pid}:meta", meta[pid])
+
+        # sessions
+        sess_dirs = sorted([q for q in p_dir.iterdir() if q.is_dir() and re.match(r"^\d+$", q.name)])
+        for sess in sess_dirs:
+            sid = normalize_sid(pid, sess.name)
+            level = SESSION_MAP.get(sess.name, sess.name)
+            with driver.session() as s:
+                s.execute_write(neo4j_merge_session, pid, sid, level)
+
+            # find files inside session
+            files = sorted([f for f in sess.rglob("*.csv")])
+            # Collect window features across modalities
+            win_rows = []   # each row: {wid, t0, t1, features...}
+
+            for fpath in files:
+                modality = detect_modality(fpath.name)
+                if modality is None:
+                    continue
+                # create SignalFile node
+                fid = f"{sid}:{fpath.name}"
+                # parse time series
+                try:
+                    t, chans, fs = load_timeseries_csv(fpath)
+                except Exception as e:
+                    print(f"[WARN] Failed to read {fpath}: {e}")
+                    continue
+
+                with driver.session() as s:
+                    s.execute_write(neo4j_merge_signalfile, sid, fid, fpath, modality, fs)
+
+                idx = window_indices(t, WIN_SEC, OVERLAP)
+                if not idx:
+                    continue
+
+                # Choose representative channel(s)
+                # EEG: average across available channels
+                # IMU: stack all numeric cols
+                # ECG/PPG/RESP: pick the first channel
+                if modality == "EEG":
+                    if not chans:
+                        continue
+                    stack = np.vstack([v for v in chans.values()]).T  # [N, C]
+                    for (a, b) in idx:
+                        seg = np.nanmean(stack[a:b, :], axis=1)
+                        feats = eeg_features(seg, fs)
+                        win_rows.append({"t0": float(t[a]), "t1": float(t[b-1]), **feats})
+                elif modality == "IMU":
+                    if not chans:
+                        continue
+                    stack = np.vstack([v for v in chans.values()]).T
+                    for (a, b) in idx:
+                        feats = imu_features(stack[a:b, :], fs)
+                        win_rows.append({"t0": float(t[a]), "t1": float(t[b-1]), **feats})
+                elif modality in ["ECG", "PPG"]:
+                    if not chans:
+                        continue
+                    ch = list(chans.values())[0]
+                    for (a, b) in idx:
+                        feats = hrv_from_ecg_ppg(ch[a:b], fs)
+                        win_rows.append({"t0": float(t[a]), "t1": float(t[b-1]), **feats})
+                elif modality == "RESP":
+                    if not chans:
+                        continue
+                    ch = list(chans.values())[0]
+                    for (a, b) in idx:
+                        feats = resp_features(ch[a:b], fs)
+                        win_rows.append({"t0": float(t[a]), "t1": float(t[b-1]), **feats})
+
+            # Aggregate per (t0,t1): merge features across modalities
+            if not win_rows:
+                continue
+            dfw = pd.DataFrame(win_rows)
+            # combine rows with identical windows by t0,t1 (mean across modalities)
+            dfw = dfw.groupby(["t0", "t1"], as_index=False).mean(numeric_only=True)
+
+            # Proxy labels within this session
+            dfw = proxy_rules(dfw)
+
+            # Write windows + features + events
+            with driver.session() as s:
+                for _, r in dfw.iterrows():
+                    wid = f"{sid}:{int(r['t0']*1000)}-{int(r['t1']*1000)}"
+                    # collect feature columns (exclude flags)
+                    feats = {k: float(v) for k, v in r.items()
+                             if k not in ["t0", "t1", "EEG_anomaly", "Gait_instability", "Stress_flag", "TIA_like"]
+                             and isinstance(v, (int, float, np.floating))}
+                    s.execute_write(neo4j_merge_window_features, wid, sid, r["t0"], r["t1"], feats)
+                    flags = {
+                        "EEG_anomaly": int(r.get("EEG_anomaly", 0)),
+                        "Gait_instability": int(r.get("Gait_instability", 0)),
+                        "Stress_flag": int(r.get("Stress_flag", 0)),
+                        "TIA_like": int(r.get("TIA_like", 0)),
+                    }
+                    s.execute_write(neo4j_merge_events, wid, flags)
+
+    print("✅ KG build completed.")
+
+if __name__ == "__main__":
+    print(f"DATA_ROOT = {DATA_ROOT}")
+    assert DATA_ROOT.exists(), f"DATA_ROOT does not exist: {DATA_ROOT}"
+    build()

@@ -1,24 +1,18 @@
-# Core scientific stack
+# Core
 numpy
 pandas
-scikit-learn
 scipy
-matplotlib
-seaborn
+tqdm
+pyarrow
+python-dotenv
 
-# Deep learning
-torch
-torchvision
-torchaudio
+# ML / anomaly detection
+scikit-learn
 
-# Signal processing / EEG / physiology
+# Physio & EEG
 mne
 neurokit2
 
-# Graph / Knowledge graph
-networkx
+# Graph
 neo4j
-
-# Jupyter environment
-jupyterlab
-ipykernel
+networkx
