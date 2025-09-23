@@ -1,0 +1,24 @@
+# Core scientific stack
+numpy
+pandas
+scikit-learn
+scipy
+matplotlib
+seaborn
+
+# Deep learning
+torch
+torchvision
+torchaudio
+
+# Signal processing / EEG / physiology
+mne
+neurokit2
+
+# Graph / Knowledge graph
+networkx
+neo4j
+
+# Jupyter environment
+jupyterlab
+ipykernel
