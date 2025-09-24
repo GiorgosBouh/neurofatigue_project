@@ -97,52 +97,64 @@ def detect_modality(fname: str) -> Optional[str]:
     return None
 
 def load_timeseries_csv(path: Path) -> Tuple[np.ndarray, Dict[str, np.ndarray], float]:
-    """
-    Returns (t seconds, channels dict{name->np.array}, fs)
-    Assumes either:
-    - a 'timestamp' or 'time' column in seconds, or
-    - uniform sampling (fallback DEFAULT_FS)
-    """
     df = pd.read_csv(path)
     cols = df.columns.tolist()
-    t = None
+
+    # get time vector
     if "timestamp" in df.columns:
-        t = df["timestamp"].to_numpy(dtype=float)
+        t = pd.to_numeric(df["timestamp"], errors="coerce").to_numpy(dtype=float)
     elif "time" in df.columns:
-        t = df["time"].to_numpy(dtype=float)
+        t = pd.to_numeric(df["time"], errors="coerce").to_numpy(dtype=float)
     else:
-        # create synthetic time assuming uniform sampling
+        t = None
+
+    if t is None or not np.isfinite(t).any():
+        # synthetic time if none/invalid
         fs = DEFAULT_FS
         t = np.arange(len(df)) / fs
+    else:
+        # clean the time vector
+        t = t[np.isfinite(t)]
+        # if the file had non-time columns removed length, rebuild t to match rows
+        if t.size != len(df):
+            # fallback: synthetic time
+            fs = DEFAULT_FS
+            t = np.arange(len(df)) / fs
 
-    # estimate fs from time if possible
+    # estimate fs robustly
     dt = np.diff(t)
-    fs = DEFAULT_FS if len(dt) == 0 else 1.0 / np.median(dt)
+    dt = dt[np.isfinite(dt) & (dt > 0)]
+    fs = (1.0 / np.median(dt)) if dt.size else DEFAULT_FS
 
-    # numeric channels (exclude timestamp/time)
+    # numeric channels (exclude time cols)
     chan_cols = [c for c in cols if c.lower() not in ["timestamp", "time"]]
     chans = {}
     for c in chan_cols:
-        try:
-            vals = pd.to_numeric(df[c], errors="coerce").to_numpy(dtype=float)
-            if np.isfinite(vals).sum() > 0:
-                chans[c] = np.nan_to_num(vals)
-        except Exception:
-            continue
+        vals = pd.to_numeric(df[c], errors="coerce").to_numpy(dtype=float)
+        if np.isfinite(vals).sum() > 0:
+            chans[c] = np.nan_to_num(vals)
     return np.asarray(t, dtype=float), chans, float(fs)
 
 # -------------------------
 # Feature extraction
 # -------------------------
-def window_indices(t: np.ndarray, win_sec: float, overlap: float) -> List[Tuple[int, int]]:
-    if len(t) < 2:
+def window_indices(t: np.ndarray, win_sec: float, overlap: float):
+    t = np.asarray(t, dtype=float)
+    if t.size < 2:
         return []
-    fs_est = 1.0 / np.median(np.diff(t))
-    wlen = int(round(win_sec * fs_est))
+    dt = np.diff(t)
+    # keep only positive, finite deltas to estimate fs robustly
+    dt = dt[np.isfinite(dt) & (dt > 0)]
+    fs_est = 1.0 / np.median(dt) if dt.size else DEFAULT_FS
+
+    # ensure window length >= 2 samples
+    wlen = max(2, int(round(win_sec * fs_est)))
     hop = max(1, int(round(wlen * (1 - overlap))))
+
     idx = []
+    N = t.size
     start = 0
-    while start + wlen <= len(t):
+    while start + wlen <= N:
         idx.append((start, start + wlen))
         start += hop
     return idx
