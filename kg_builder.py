@@ -407,12 +407,25 @@ def collect_metadata(data_root: Path) -> Dict[str, Dict]:
     return out
 
 def build():
+    import gc
+    from os import getenv
+
     print(f"Connecting to Neo4j at {NEO4J_URI} ...")
     init_constraints()
     surveys = collect_surveys(DATA_ROOT)
     meta = collect_metadata(DATA_ROOT)
 
+    # Gather participants
     participants = sorted([p for p in DATA_ROOT.iterdir() if p.is_dir() and re.match(r"^\d+$", p.name)])
+
+    # Limit how many to process (helps avoid OOM). Set MAX_PARTICIPANTS in .env if you want more.
+    try:
+        max_parts = int(getenv("MAX_PARTICIPANTS", "3"))
+    except ValueError:
+        max_parts = 3
+    if max_parts > 0:
+        participants = participants[:max_parts]
+
     for p_dir in tqdm(participants, desc="Participants"):
         pid = normalize_pid(p_dir.name)
         with driver.session() as s:
@@ -436,66 +449,86 @@ def build():
 
             # find files inside session
             files = sorted([f for f in sess.rglob("*.csv")])
-            # Collect window features across modalities
-            win_rows = []   # each row: {wid, t0, t1, features...}
+
+            # Collect window features across modalities (we'll merge later by t0,t1)
+            win_rows = []   # each row: {t0, t1, features...}
 
             for fpath in files:
                 modality = detect_modality(fpath.name)
                 if modality is None:
                     continue
-                # create SignalFile node
-                fid = f"{sid}:{fpath.name}"
-                # parse time series
+
+                # parse time series (may fail on odd files)
                 try:
                     t, chans, fs = load_timeseries_csv(fpath)
                 except Exception as e:
                     print(f"[WARN] Failed to read {fpath}: {e}")
                     continue
 
+                # create/merge SignalFile node
+                fid = f"{sid}:{fpath.name}"
                 with driver.session() as s:
                     s.execute_write(neo4j_merge_signalfile, sid, fid, fpath, modality, fs)
 
                 idx = window_indices(t, WIN_SEC, OVERLAP)
-                if not idx:
+                if not idx or not np.isfinite(t).any():
                     continue
 
-                # Choose representative channel(s)
-                # EEG: average across available channels
-                # IMU: stack all numeric cols
-                # ECG/PPG/RESP: pick the first channel
+                N = len(t)
+
+                # EEG: average across channels
                 if modality == "EEG":
                     if not chans:
                         continue
                     stack = np.vstack([v for v in chans.values()]).T  # [N, C]
                     for (a, b) in idx:
+                        if not (0 <= a < b <= N):
+                            continue
                         seg = np.nanmean(stack[a:b, :], axis=1)
                         feats = eeg_features(seg, fs)
                         win_rows.append({"t0": float(t[a]), "t1": float(t[b-1]), **feats})
+
+                # IMU: stack all numeric cols
                 elif modality == "IMU":
                     if not chans:
                         continue
                     stack = np.vstack([v for v in chans.values()]).T
                     for (a, b) in idx:
+                        if not (0 <= a < b <= N):
+                            continue
                         feats = imu_features(stack[a:b, :], fs)
                         win_rows.append({"t0": float(t[a]), "t1": float(t[b-1]), **feats})
+
+                # ECG/PPG: first channel → HRV features (can be heavy)
                 elif modality in ["ECG", "PPG"]:
                     if not chans:
                         continue
                     ch = list(chans.values())[0]
                     for (a, b) in idx:
+                        if not (0 <= a < b <= N):
+                            continue
                         feats = hrv_from_ecg_ppg(ch[a:b], fs)
                         win_rows.append({"t0": float(t[a]), "t1": float(t[b-1]), **feats})
+
+                # RESP: first channel → rate/instability
                 elif modality == "RESP":
                     if not chans:
                         continue
                     ch = list(chans.values())[0]
                     for (a, b) in idx:
+                        if not (0 <= a < b <= N):
+                            continue
                         feats = resp_features(ch[a:b], fs)
                         win_rows.append({"t0": float(t[a]), "t1": float(t[b-1]), **feats})
 
+                # free per-file arrays ASAP
+                del chans
+
             # Aggregate per (t0,t1): merge features across modalities
             if not win_rows:
+                gc.collect()
                 continue
+
             dfw = pd.DataFrame(win_rows)
             # combine rows with identical windows by t0,t1 (mean across modalities)
             dfw = dfw.groupby(["t0", "t1"], as_index=False).mean(numeric_only=True)
@@ -519,6 +552,13 @@ def build():
                         "TIA_like": int(r.get("TIA_like", 0)),
                     }
                     s.execute_write(neo4j_merge_events, wid, flags)
+
+            # free memory per session
+            del win_rows, dfw
+            gc.collect()
+
+        # free memory per participant
+        gc.collect()
 
     print("✅ KG build completed.")
 
