@@ -5,6 +5,7 @@ scipy
 tqdm
 pyarrow
 python-dotenv
+openpyxl   # Excel file support
 
 # ML / anomaly detection
 scikit-learn
