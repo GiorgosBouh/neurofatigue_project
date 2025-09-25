@@ -662,22 +662,21 @@ TTL_TEXT = r"""
 """
 
 def main():
-    g = Graph()
-    g.parse(data=TTL_TEXT, format="turtle")
-
-    base_dir = Path("/Users/user/Documents/ontology_and_biomechanics")
-
-    base_dir.mkdir(parents=True, exist_ok=True)
+    # Βάση στον home του τρέχοντος χρήστη (Ubuntu -> /home/ubuntu, Mac -> /Users/user)
+    base_dir = Path.home() / "Documents" / "ontology_and_biomechanics"
+    base_dir.mkdir(parents=True, exist_ok=True)  # φτιάχνει αν δεν υπάρχει
 
     ttl_path = base_dir / "gait_cpgo_clinical_v0_4_1.ttl"
     owl_path = base_dir / "gait_cpgo_clinical_v0_4_1.owl"
 
-    g.serialize(destination=str(ttl_path), format="turtle")  # UTF-8, χωρίς BOM
-    g.serialize(destination=str(owl_path), format="xml")     # RDF/XML (SAX-safe)
+    g = Graph()
+    g.parse(data=TTL_TEXT, format="turtle")
+    g.serialize(destination=str(ttl_path), format="turtle")
+    g.serialize(destination=str(owl_path), format="xml")
 
     print("Written:")
-    print(" -", ttl_path.resolve())
-    print(" -", owl_path.resolve())
+    print(" -", ttl_path)
+    print(" -", owl_path)
 
 if __name__ == "__main__":
     main()
