@@ -3,6 +3,7 @@
 # pip install rdflib
 
 from rdflib import Graph
+from pathlib import Path
 
 TTL_TEXT = r"""
 @prefix : <http://example.org/gait-ontology#> .
