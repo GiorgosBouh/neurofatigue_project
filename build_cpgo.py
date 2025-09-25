@@ -661,22 +661,10 @@ TTL_TEXT = r"""
   [ a owl:Restriction ; owl:onProperty :observedCompensation ; owl:minQualifiedCardinality "0"^^xsd:nonNegativeInteger ; owl:onClass :CompensationStrategy ] .
 """
 
-import argparse
-from pathlib import Path
-from rdflib import Graph
-
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--output", type=str, default=None,
-                        help="Output directory for ontology files")
-    args = parser.parse_args()
-
-    if args.output:
-        base_dir = Path(args.output).expanduser()
-    else:
-        base_dir = Path.home() / "Documents" / "ontology_and_biomechanics"
-
-    base_dir.mkdir(parents=True, exist_ok=True)
+    # Βάση στον home του τρέχοντος χρήστη (Ubuntu -> /home/ubuntu, Mac -> /Users/user)
+    base_dir = Path.home() / "Documents" / "ontology_and_biomechanics"
+    base_dir.mkdir(parents=True, exist_ok=True)  # φτιάχνει αν δεν υπάρχει
 
     ttl_path = base_dir / "gait_cpgo_clinical_v0_4_1.ttl"
     owl_path = base_dir / "gait_cpgo_clinical_v0_4_1.owl"
