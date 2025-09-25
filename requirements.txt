@@ -17,3 +17,5 @@ neurokit2
 # Graph
 neo4j
 networkx
+rdflib>=6.3.0
+owlrl>=6.0.2
